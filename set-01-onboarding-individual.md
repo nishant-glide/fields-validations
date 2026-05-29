@@ -22,6 +22,7 @@ The biggest cross-cutting gaps surfaced by this set:
 | 10 | `UpdateProspectFieldsRequest` data fields | `sourceOfIncomeOrFunds`, `purposeOfAccount` have NO `@Size` at gateway, but downstream `UpdateComplianceDataRequest` only has `@NotNull` (also no length); DB has 255 | ⚠ No upper bound enforced anywhere except DB. |
 | 11 | `CreateSignzyJourneyRequest` | Gateway controller accepts the **downstream DTO directly** (no gateway-layer DTO defined). No validation anywhere; only a manual `null`-check in the controller. | ⚠ Gateway leaks downstream contract; no field-level validation. |
 | 12 | `PartnerSsnFetchRequest` | Gateway has strong `@Pattern` validation for phone/SSN/DOB. Downstream `SsnFetchRequest` has **no validation** on those fields. | ⚠ Consistent only because gateway enforces it. |
+| 13 | **Async / Kafka-driven persistence** — Set 1 entities emit Kafka events that produce side-effect writes to `hathor_signzy`, `hathor_ofac`, `hathor_ofac_address`, `iris_account_action_history`, `iris_account_review`, `demeter_webhook_outbound_event_log`, `hathor_user_credential_update_log`. **None of these store partner data in typed columns** that need validation alignment — all use jsonb/text payloads or server-controlled enums. See "Async / Kafka-driven persistence" section after §7 for the full trace. | ✅ No new gaps from the async surface. |
 
 Mythological-prefix mapping confirmed for this set:
 - `khonsu_*` → **glide-prospects** (prospect data)
@@ -243,6 +244,25 @@ Downstream `CloseAccountRequest` also carries `status` (always "closed-pending")
 
 ---
 
+## Async / Kafka-driven persistence
+
+JPA `@PostPersist`/`@PostUpdate` listeners on `ClientEntity`, `SpendingAccountEntity`, `ClientAccountEntity`, and `SignzyEntity` publish events to topics `elastic_data_migration`, `account_logs`, `partner_webhook_outbound_event` (consumed by glide-search, glide-portal, glide-webhook). Event classes: `ClientProfileCreationEvent`, `SpendingAccountUpdateEvent`, `SignzyJourneyUrlCreatedEvent`, `KycDetailsReceivedEvent`, `AccountClosePendingEvent`, `FullKycCompletedEvent`, `CustomerActionEvent`, `SignzyOfacEvent`, `SignzySsnTraceEvent`.
+
+**None of the async-written tables hold partner data in typed columns**, so no new validation alignment is required. Listed for completeness:
+
+| Table | Columns holding partner data | Verdict |
+|---|---|---|
+| `hathor_signzy` | `request` jsonb · `response` jsonb (partner data inside blob); typed cols `identifier`(100), `journey_url`(300, Signzy-gen), `journey_id`(100), `status`/`step`(50–100 enums) are server-controlled | ❌ Skip |
+| `hathor_ofac` | `request`/`response` text (partner data inside); typed cols `identifier`(100), `provider`(40), 11 boolean flags — server | ❌ Skip |
+| `hathor_ofac_address` | Same shape as `hathor_ofac` | ❌ Skip |
+| `iris_account_action_history` | `action_type`(50), `source_system`(50), `journey_id`(255) — all server-controlled enums | ❌ Skip |
+| `iris_account_review` | `primary_account`(20, matches `osiris_client_account.account_id`), `review_comment` text (operator-written) | ❌ Skip |
+| `demeter_webhook_outbound_event_log` | `event_payload` **text** (unbounded JSON, partner-visible contract inherited from event class — re-uses §1–§7 DTOs), `event_type`(100), `event_id`(255), `signature`(300) | ⚠ Soft — no column-width gap |
+| `hathor_user_credential_update_log` | Stores old/new email/phone on `updateIndividualAccount`. Schema not audited here — assumed to mirror `hathor_client.email_id`(100) / `primary_phone`(20). | ⚠ Flag for follow-up audit (see Rec #10) |
+| Elasticsearch indices (`elastic_data_migration` topic) | Not Postgres — out of scope | — |
+
+---
+
 ## Verification
 
 Spot-checked one full trace for each endpoint:
@@ -270,3 +290,5 @@ Spot-checked one full trace for each endpoint:
 7. Convert `CreateAccountRequest.personalInfo.dateOfBirth` from `String` to `LocalDate` + `@Past` + `@JsonFormat("yyyy-MM-dd")`.
 8. Add `@Pattern("\\d{1,15}")` to `phoneNumber` at every gateway DTO.
 9. Introduce a gateway-layer `CreateJourneyUrlRequest` DTO (the current controller leaks the downstream type).
+10. (async) Audit `hathor_user_credential_update_log` column widths against `hathor_client.email_id`(100) / `primary_phone`(20) to ensure the audit log can store the values the source row holds.
+11. (async) Confirm the JSON contract emitted to `demeter_webhook_outbound_event_log.event_payload` — partner-facing webhook payload re-uses Set 1 DTO field shapes. If any DTO width is tightened in the consistency pass, also update the corresponding event class so the partner sees consistent caps.
