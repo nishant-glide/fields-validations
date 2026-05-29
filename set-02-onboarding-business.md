@@ -301,66 +301,58 @@ Same field-by-field as §8 (DTO re-used).
 
 ## Async / Kafka-driven persistence
 
-Set 2 has the **broadest async surface** of any set in this doc. When a business account is created/verified or a business prospect is saved, JPA listeners publish Kafka events that fan out to glide-business (default-user setup, dashboard modules, transaction policy seeding), glide-portal (audit), glide-webhook (partner webhook), and glide-search. Two of the async-written tables receive partner-supplied data in **typed columns with width mismatches** — these are real validation gaps and they are listed in the Headline findings (rows #21–#23).
+Set 2 emits Kafka events on every entity persist. Two downstream tables (`cronus_business_users`, `hathor_business_client`) receive partner-supplied keyPerson data in typed columns with width mismatches — already in Headline rows #21–#23. Full column breakdown below.
 
-### Event-emitting entities (Set 2)
+**Event chain:** `osiris_business_account` `@PostPersist` → `ClientProfileCreationEvent` (carries keyPerson firstName/lastName/email/phone/companyId) → topic `glide.kafka.consumer.client-account.event` → glide-business `KafkaEventConsumer.createBusinessClient` → INSERT `cronus_business_users` + assign default group. `BusinessClientEntity` (`hathor_business_client`) is written by glide-client when the keyPerson becomes a business-client.
 
-| Source entity | Listener | Kafka topic(s) |
+### `cronus_business_users` — async INSERT (full schema)
+
+| # | Column | Type | Source | Aligned | Notes |
+|---|---|---|---|---|---|
+| 1 | `id` | bigint | server | ✅ | PK |
+| 2 | `business_id` | bigint NOT NULL | server (from event) | ✅ | |
+| 3 | `client_id` | bigint | server (after client created) | ✅ | |
+| 4 | `first_name` | varchar(**255**) | `keyPerson.firstName` (gateway @Size=20) | ❌ | New outlier — 20/32/50/150/255 across codebase. |
+| 5 | `last_name` | varchar(**255**) | `keyPerson.lastName` (gateway @Size=20) | ❌ | Same. |
+| 6 | `email` | varchar(**255**) | `keyPerson.email` (gateway @Size=100) | ❌ | Inconsistent with `hathor_*.email`(100). |
+| 7 | `phone` | varchar(**15**) | `keyPerson.phoneNumber` (gateway @Size=20) | ❌ | **Truncation/INSERT fail** for 16–20 char phones. |
+| 8 | `status` | varchar(15) | server | ✅ | enum-as-string |
+| 9 | `session_id` | varchar(40) | server | ✅ | |
+| 10 | `monthly_fx_limit` | numeric | server (policy) | ✅ | |
+| 11 | `bank_transfer_allowed` | boolean | server | ✅ | |
+| 12 | `group_to_assign` | bigint | server | ✅ | FK to `cronus_business_user_groups` |
+| 13 | `created_by`, `created_on`, `updated_on` | bigint / timestamps | server | ✅ | |
+
+### `hathor_business_client` — sync write by glide-client when keyPerson linked
+
+| # | Column | Type | Source | Aligned | Notes |
+|---|---|---|---|---|---|
+| 1 | `id` | bigint | server | ✅ | PK |
+| 2 | `client_id` | bigint NOT NULL | server | ✅ | |
+| 3 | `business_id` | bigint NOT NULL | server | ✅ | |
+| 4 | `first_name` | varchar(32) **NOT NULL** | `keyPerson.firstName` (gateway @Size=20) | ⚠ | Gateway tighter (safe), but NOT NULL — mapper must always send a value. |
+| 5 | `last_name` | varchar(32) **NOT NULL** | `keyPerson.lastName` (gateway @Size=20) | ⚠ | Same. |
+| 6 | `email` | varchar(100) | `keyPerson.email` (gateway @Size=100) | ✅ | |
+| 7 | `phone` | varchar(**10**) | `keyPerson.phoneNumber` (gateway @Size=20) | ❌ | Third width for the same field (10/15/20 across hathor_business / cronus_business_users / gateway). |
+| 8 | `phone_country_code` | varchar(6) | `keyPerson.phoneCountryCode` (gateway @Pattern \d{1,4}) | ✅ | |
+| 9 | `address_id` | bigint | FK → `hathor_client_address` | ✅ | |
+| 10 | `request_identifier` | varchar (**unbounded**) | server | ❌ | Schema oversight — no `length=` set. |
+| 11 | `removed` | boolean | server | ✅ | |
+| 12 | `company_id`, `relationship_id` | bigint | server | ✅ | |
+| 13 | `created_on`, `updated_on` | timestamp | server | ✅ | |
+
+### Other async-touched tables (no validation alignment needed)
+
+| Table | Why no gap | Verdict |
 |---|---|---|
-| `BusinessProspectEntity` (`khonsu_business_prospect`) | `BusinessProspectEntityListener` (glide-prospects) | publishes via `KafkaBuProducer.publishBusinessProspectDetails` |
-| `BuProspectOwnerEntity` (`khonsu_bu_prospect_owners`) | `BusinessOwnerEntityListener` (glide-prospects) | publishes via `KafkaBuProducer` |
-| `BusinessEntity` (`hathor_business`) | `BusinessEntityListener` (glide-client) | `business_account_logs` |
-| `BusinessClientEntity` (`hathor_business_client`) | `BusinessClientEntityListener` (glide-client) | `elastic_data_migration` |
-| `BusinessAccountEntity` (`osiris_business_account`) | `BusinessAccountEntityListener` (glide-client-account) | `business_account_logs`, `partner_webhook_outbound_event`, **`glide.kafka.consumer.client-account.event`** (the `ClientProfileCreationEvent` that triggers business-user setup) |
-| `BusinessProfileEntity` (`cronus_business_profile`) | `ProfileEntityListener` (glide-business) | internal |
-| `BusinessAdditionalInfoEntity` (`cronus_business_additional_info`) | `AdditionalInfoEntityListener` (glide-business) | internal |
-
-Event classes carrying partner-derived data: `ClientProfileCreationEvent` (keyPerson firstName/lastName/email/phone/companyId), `BusinessAccountEvent`, `BusinessEvent`, `BusinessAccountVerifiedEvent`, `LexNexDataEvent`, `SignzyOfacEvent`, `SignzySsnTraceEvent`, `BusinessAccountInvestigationEvent`.
-
-### Tables written as a side-effect (Set 2)
-
-#### 🔴 Tables with partner-input typed columns (validation alignment needed)
-
-| Table | Trigger | Partner field source → DB column | Issue |
-|---|---|---|---|
-| **`cronus_business_users`** | `osiris_business_account` `@PostPersist` → `ClientProfileCreationEvent` → glide-business `KafkaEventConsumer.createBusinessClient` → `userService.createUserOrAssignGroup` INSERTs row | `keyPerson.firstName` (gateway @Size=20) → `first_name` varchar(**255**) nullable<br>`keyPerson.lastName` (gateway @Size=20) → `last_name` varchar(**255**) nullable<br>`keyPerson.email` (gateway @Size=100) → `email` varchar(**255**) nullable<br>`keyPerson.phoneNumber` (gateway @Size=20) → `phone` varchar(**15**) nullable<br>`businessId` → `business_id` bigint NOT NULL<br>(server) → `status` varchar(15), `session_id` varchar(40) | ❌ **`phone` varchar(15) is narrower than gateway @Size(max=20)** — async INSERT failure for 16–20 char phones (partner sees account created, never sees user). ❌ Other widths add new outliers to the codebase. |
-| **`hathor_business_client`** | Created when the keyPerson is linked as a business-client (downstream of business-account create) | `keyPerson.firstName` → `first_name` varchar(32) **NOT NULL**<br>`keyPerson.lastName` → `last_name` varchar(32) **NOT NULL**<br>`keyPerson.email` → `email` varchar(100)<br>`keyPerson.phoneNumber` → `phone` varchar(**10**)<br>`keyPerson.phoneCountryCode` → `phone_country_code` varchar(6)<br>`businessId` → `business_id` bigint NOT NULL<br>`clientId` → `client_id` bigint NOT NULL<br>`address_id` → FK to `hathor_client_address` | ❌ `phone` is now the THIRD width for the same logical field (10 here / 15 cronus / 20 gateway / 10 hathor_business). ❌ first_name/last_name NOT NULL — if mapper sends null for non-individual flows, INSERT fails. `request_identifier` is **unbounded varchar** (schema oversight). |
-
-#### ⚠ Tables with KYC/audit data (server-controlled enums, low validation relevance)
-
-| Table | Trigger | What it stores | Verdict |
-|---|---|---|---|
-| `osiris_business_lexnex_response` | LexNex business-KYC check (KYC waterfall on business account create) | `request` jsonb · `response` jsonb · `business_verification` varchar(100) · `owner_summary_dob` varchar(10) · `error_message` varchar(1000) · `business_lexnex_check_status` varchar(**20**) · `owner_lexnex_check_status` varchar(**30**) · `owner_ofac_check_status` varchar(30) · 12 boolean flags | ⚠ Same logical KYC-status field at two widths (20 vs 30) on the same table — minor server-side enum drift. Partner data is inside the jsonb columns. |
-| `osiris_business_owner_kyc_status` | Per-owner KYC tracking | `owner_id` varchar(255) · `ofac_status` varchar(30) · `kyc_status` varchar(30) | ❌ Skip — server-controlled enums only |
-| `hathor_signzy` | If business uses Signzy KYC | Same shape as Set 1 — jsonb/text blobs | ❌ Skip |
-| `hathor_ofac`, `hathor_ofac_address` | OFAC waterfall on keyPerson + owners | Same shape as Set 1 — text blobs | ❌ Skip |
-
-#### ⚠ Tables for default modules / authorization (server-controlled, no partner data)
-
-| Table | Trigger | Verdict |
-|---|---|---|
-| `cronus_business_user_groups` | Default Admin/Owner group seeded on business creation; `name` varchar(25), `description` varchar(50) — server-generated | ❌ Skip |
-| `cronus_user_group_membership` | keyPerson assigned to admin group | ❌ Skip — FK linkage only |
-| `cronus_business_dashboard_modules`, `cronus_dashboard_modules`, `cronus_user_dashboard_modules` | Default dashboard enablement on business verify (`BusinessAccountVerifiedEvent` → glide-business `DashboardService.accountVerified`) | ❌ Skip — boolean flags + module_id refs |
-| `cronus_state_machine` | Business state machine initialized; `state_id` / `state_machine_name` / `status` varchar(50) server-controlled + `attributes` jsonb | ❌ Skip |
-| `cronus_transaction_policy` | Default per-business transaction policy seeded; `name` varchar(255), `account_number`/`identifier`/`transaction_type` **unbounded varchar** (schema oversight) | ⚠ Minor — server-seeded but unbounded varchars are a schema-quality issue worth a one-line follow-up |
-| `cronus_user_policy_mapping`, `cronus_user_group_rules` | Authorization linkage | ❌ Skip |
-
-#### ⚠ Audit / event-log (same shape as Set 1)
-
-| Table | Trigger | Verdict |
-|---|---|---|
-| `iris_account_action_history` | Account state-change audit | ❌ Skip (Set 1) |
-| `iris_account_review` | Manual review queue (compliance ops) | ❌ Skip (Set 1) |
-| `demeter_webhook_outbound_event_log` | Outbound partner webhook log; payload re-uses Set 2 DTO field shapes | ⚠ Soft — payload `text` blob; partner-visible JSON contract inherited from event classes |
-
-### Conclusion for Set 2
-
-**Two real production gaps surface from the async surface** (Headline rows #21–#23 above):
-1. `cronus_business_users.phone` = varchar(15) cannot store gateway's @Size(20) phone — async INSERT fails silently after sync layers succeed.
-2. `cronus_business_users` and `hathor_business_client` add new outlier widths to the cross-table inconsistencies for `first_name`/`last_name`/`email`/`phone`.
-
-Authorization, dashboard module, and KYC-blob tables are operator-/server-controlled and do not need validation alignment.
+| `osiris_business_lexnex_response` | Partner data in `request`/`response` jsonb. Typed cols are server-controlled (`business_lexnex_check_status` 20 vs `owner_lexnex_check_status` 30 — minor enum drift noted in Headline #24) | ⚠ |
+| `osiris_business_owner_kyc_status` | Only server-controlled enums (`owner_id` 255, `ofac_status`/`kyc_status` 30) | ❌ Skip |
+| `hathor_signzy`, `hathor_ofac`, `hathor_ofac_address` | Partner data in text/jsonb blobs (same shape as Set 1) | ❌ Skip |
+| `cronus_business_user_groups`, `cronus_user_group_membership`, `cronus_user_policy_mapping`, `cronus_user_group_rules` | Default groups/FK linkage seeded server-side | ❌ Skip |
+| `cronus_business_dashboard_modules`, `cronus_dashboard_modules`, `cronus_user_dashboard_modules` | Boolean flags + module_id refs, seeded on `BusinessAccountVerifiedEvent` | ❌ Skip |
+| `cronus_state_machine` | Server-controlled state + `attributes` jsonb | ❌ Skip |
+| `cronus_transaction_policy` | Default policy seeded server-side; `account_number`/`identifier`/`transaction_type` are **unbounded varchar** (schema oversight — flagged in recommendation #18) | ⚠ |
+| `iris_account_action_history`, `iris_account_review`, `demeter_webhook_outbound_event_log` | Same shape as Set 1 (audit / outbound webhook log) | ❌ Skip |
 
 ---
 
