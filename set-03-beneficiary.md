@@ -32,6 +32,9 @@ Mythology mapping confirmed:
 | 15 | `dionysus_beneficiary_account_detail.bank_name` = varchar(255) but `bank_code`/`routing_code`/`bank_account_number`/`swift_code` = varchar(100) | Bank ID widths divergent | ⚠ |
 | 16 | `dionysus_beneficiary_personal_detail` has DB columns `account_numbers` (text), `direction` — **not in JPA entity** | Schema drift. | ⚠ |
 | 17 | Card-link fields | `dionysus_beneficiary_account_detail.card_token`=varchar(no limit) NULL, `card_last4`=varchar(4) — fine but loose | ✅/⚠ |
+| 18 | **`dionysus_beneficiary_transaction_records.beneficiary_account_number` = varchar(35)** vs `dionysus_beneficiary_account_detail.account_number` = varchar(**30**) | ❌ Cross-table account-number width mismatch for the same logical concept (a beneficiary's account number). Async-written when a transaction touches a beneficiary. |
+| 19 | **`dionysus_beneficiary_transaction_records.client_account_number` = varchar(20)** vs `dionysus_international_transaction.client_account_number` = varchar(30) | ❌ Same field, two widths across the transaction record tables. |
+| 20 | **Async / Kafka-driven persistence** — Set 3 entities emit Kafka events that produce side-effect writes to `dionysus_beneficiary_transaction_records`, `iris_investigation_case`, `iris_investigation_history`, `iris_investigation_comments`, `iris_investigation_related_resource`, `demeter_webhook_outbound_event_log` (and `hathor_signzy`/`ofac` for KYC-linked beneficiaries). See "Async / Kafka-driven persistence" section after §5. | ❌ Two new cross-table width gaps (#18, #19) confirmed. |
 
 ---
 
@@ -166,6 +169,37 @@ Also: there's no `@PostMapping({"admin/...", "external/..."})` — `linkCard` is
 
 ---
 
+## Async / Kafka-driven persistence
+
+`BeneficiaryAccountDetailEntityListener` and `BeneficiaryPersonalDetailEntityListener` publish on every persist. Topics: `elastic_data_migration`, `partner_webhook_outbound_event`, `transaction_investigation_event` (on OFAC fail). Event classes: `BeneficiaryAccountDetailEvent`, `BeneficiaryPersonalDetailEvent`, `BeneficiaryWebhookEvent`, `BeneficiaryOfacEvent`. The only async-written table with typed columns receiving partner data is `dionysus_beneficiary_transaction_records` (Headline #18–#19).
+
+### `dionysus_beneficiary_transaction_records` — written async when a transaction references a beneficiary (full schema)
+
+| # | Column | Type | Source | Aligned | Notes |
+|---|---|---|---|---|---|
+| 1 | `id` | bigint | server | ✅ | PK |
+| 2 | `payment_identifier` | varchar(60) NOT NULL | `referenceId` (links to `dionysus_beneficiary_personal_detail.reference_id` varchar 60) | ✅ | |
+| 3 | `client_account_number` | varchar(**20**) NOT NULL | partner `fromAccount` | ❌ | Vs `dionysus_international_transaction.client_account_number` varchar(30) — same field, two widths. |
+| 4 | `beneficiary_account_number` | varchar(**35**) NOT NULL | partner `beneficiaryAccount` | ❌ | Vs `dionysus_beneficiary_account_detail.account_number` varchar(30) — same field, two widths. |
+| 5 | `to_currency_id` | integer NOT NULL | partner `currencyId` | ✅ | |
+| 6 | `data` | jsonb NOT NULL | full beneficiary payload (server-snapshotted) | ✅ | |
+| 7 | `channel` | varchar(50) | partner `channel` (`BeneficiaryAccountCreationRequest`) | ✅ | |
+| 8 | `created_on`, `updated_on` | timestamp | server | ✅ | |
+
+### Other async-touched tables (no validation alignment needed)
+
+| Table | Why no gap | Verdict |
+|---|---|---|
+| `iris_investigation_case` | Opened on `BeneficiaryOfacEvent`. Typed cols: `case_id`(80), `title`(250), `description`(500, server-templated, may include partner names), `status`/`priority`(20), `investigation_type`(30), `source_module`(60), `tags`(100), `resolution_summary`(500), `reference_id`(100), `correlation_id`(100), `name`(255). Partner data appears only inside templated description. | ⚠ Soft — smoke-test recommended |
+| `iris_investigation_history` | `case_id`(80), `action_type`(20), `description`(500), `old_value`/`new_value` jsonb | ⚠ Same as above |
+| `iris_investigation_comments` | `comment`(500) written by ops, not partner | ❌ Skip |
+| `iris_investigation_related_resource` | `resource_type`(20), `resource_id`(120) server-generated | ❌ Skip |
+| `demeter_webhook_outbound_event_log` | `event_payload` text blob holds `BeneficiaryWebhookEvent`. Partner-visible JSON contract inherited from event class. | ⚠ Soft |
+| `hathor_signzy`, `hathor_ofac`, `hathor_ofac_address` | jsonb/text blobs (same shape as Sets 1–2) | ❌ Skip |
+| `iris_account_review` | Operator-written `review_comment` text | ❌ Skip |
+
+---
+
 ## Verification
 
 | Endpoint | Field traced | Result |
@@ -177,6 +211,8 @@ Also: there's no `@PostMapping({"admin/...", "external/..."})` — `linkCard` is
 | `PUT /beneficiary/account/{accountNumber}` | Confirmed leading-space typo in controller path. | ✅ |
 | `POST /beneficiary/{referenceId}/link-card` | `clientId`/`businessId` XOR check is service-level only, no `@Valid`. | ✅ |
 | `dionysus_beneficiary_personal_detail` schema drift | `account_numbers` text + `direction` varchar(20) present in DB, missing on entity. | ✅ Confirmed drift. |
+| (async) `dionysus_beneficiary_transaction_records.beneficiary_account_number` varchar(35) vs `dionysus_beneficiary_account_detail.account_number` varchar(30) | ✅ Confirmed — same logical field, two widths. |
+| (async) `iris_investigation_case.description` varchar(500) | ✅ Server-formatted — partner data may appear in templated text, low truncation risk for typical names/addresses but worth a smoke test. |
 
 ---
 
@@ -196,3 +232,7 @@ Also: there's no `@PostMapping({"admin/...", "external/..."})` — `linkCard` is
 12. Cap `dionysus_beneficiary_account_detail.card_token` (currently unbounded varchar) to something sensible like varchar(255).
 13. Reconcile `dionysus_beneficiary_account_detail.account_number` (varchar 30) with `osiris_client_account.account_id` (varchar 20) — pick one.
 14. Add `clientIpAddress` storage on beneficiary entities (currently parameter is accepted but never persisted) — or drop it from the DTOs.
+15. **(async, cross-table)** Reconcile `beneficiary_account_number` width across `dionysus_beneficiary_account_detail.account_number` (30), `dionysus_international_transaction.beneficiary_account_number` (35), `dionysus_beneficiary_transaction_records.beneficiary_account_number` (35) — pick one canonical width.
+16. **(async, cross-table)** Reconcile `client_account_number` / `from_account` width across `dionysus_international_transaction.client_account_number` (30), `dionysus_beneficiary_transaction_records.client_account_number` (20), `osiris_client_account.account_id` (20). Same logical field at two widths.
+17. (async) Spot-check `iris_investigation_case.description` (varchar 500) under realistic OFAC-failure scenarios — if business names exceed 100 chars and a templated description includes them verbatim, the audit text may truncate. Either widen to text (unbounded) or shorten the template.
+18. (async) Confirm the JSON payload contract on `demeter_webhook_outbound_event_log.event_payload` for `BeneficiaryWebhookEvent` — partner-visible shape inherits from this event class. If beneficiary DTO widths change in the consistency pass, update the event class too.
